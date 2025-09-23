@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-BingX Futures LIVE (15m) — Multi-Engine Signals + OCO Protection + Trailing + Explanatory Logs
+BingX Futures LIVE (15m) — Wilder Indicators + Protected Orders + Filters + KeepAlive
+(Strategy engine upgraded + OCO verification + explanatory logs)
 """
 
-# ======================= Imports / Setup =======================
 import os, time, math, threading, requests
 import pandas as pd
 import ccxt
@@ -12,7 +12,25 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-# ——— Icons / Colors ———
+# ======== Config ========
+SYMBOL       = os.getenv("SYMBOL", "DOGE/USDT:USDT")
+INTERVAL     = os.getenv("INTERVAL", "15m")
+LEVERAGE     = int(float(os.getenv("LEVERAGE", "10")))
+RISK_ALLOC   = float(os.getenv("RISK_ALLOC", "0.60"))   # 60% of balance
+TRADE_MODE   = os.getenv("TRADE_MODE", "live").lower()  # live/paper
+SELF_URL     = os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("SELF_URL", "")
+
+# Strategy thresholds (كما هي ولكن سنستخدمها في محرك إشارات أقوى)
+RSI_LONG_TH      = float(os.getenv("RSI_LONG_TH", "55"))
+RSI_SHORT_TH     = float(os.getenv("RSI_SHORT_TH", "45"))
+MIN_ADX          = float(os.getenv("MIN_ADX", "18"))
+MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.004"))  # 0.4%
+COOLDOWN_BARS    = int(os.getenv("COOLDOWN_BARS", "1"))
+
+API_KEY    = os.getenv("BINGX_API_KEY", "")
+API_SECRET = os.getenv("BINGX_API_SECRET", "")
+
+# ======== Icons / colors ========
 try:
     from termcolor import colored
 except Exception:
@@ -21,7 +39,7 @@ except Exception:
 IC_HDR="📊"; IC_BAL="💰"; IC_PRC="💲"; IC_EMA="📈"; IC_RSI="📉"; IC_ADX="📐"; IC_ATR="📏"
 IC_POS="🧭"; IC_TP="🎯"; IC_SL="🛑"; IC_TRD="🟢"; IC_CLS="🔴"; IC_OK="✅"; IC_BAD="❌"; IC_SHD="🛡️"
 IC_BUY="🟩 BUY"; IC_SELL="🟥 SELL"
-SEP = colored("—"*92, "cyan")
+SEP = colored("—"*78, "cyan")
 
 def log(msg, color="white"):
     print(colored(msg, color), flush=True)
@@ -33,37 +51,12 @@ def fmt(v, d=2, na="N/A"):
     except Exception:
         return na
 
-# ======================= Config =======================
-SYMBOL       = os.getenv("SYMBOL", "DOGE/USDT:USDT")
-INTERVAL     = os.getenv("INTERVAL", "15m")
-LEVERAGE     = int(float(os.getenv("LEVERAGE", "10")))
-RISK_ALLOC   = float(os.getenv("RISK_ALLOC", "0.60"))   # احتياطي (لن نستخدمه للحجم؛ نستخدم RISK_PCT)
-TRADE_MODE   = os.getenv("TRADE_MODE", "live").lower()  # live/paper
-SELF_URL     = os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("SELF_URL", "")
-
-# Strategy thresholds (قابلة للتعديل من ENV)
-RSI_LONG_TH      = float(os.getenv("RSI_LONG_TH", "55"))
-RSI_SHORT_TH     = float(os.getenv("RSI_SHORT_TH", "45"))
-MIN_ADX          = float(os.getenv("MIN_ADX", "18"))    # يسمح بإشارات MR/PB
-MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.004"))  # 0.4%
-COOLDOWN_BARS    = int(os.getenv("COOLDOWN_BARS", "2")) # كوولداون بالشموع
-RISK_PCT         = float(os.getenv("RISK_PCT", "0.01")) # 1% مخاطرة/صفقة
-
-# قواطع السوق
-ADX_TREND = max(MIN_ADX, 22)
-ADX_RANGE = 18
-ATR_BREAKER_PCT = 3.0
-SPIKE_MULT = 2.0
-
-API_KEY    = os.getenv("BINGX_API_KEY", "")
-API_SECRET = os.getenv("BINGX_API_SECRET", "")
-
 def safe_symbol(s: str) -> str:
     if s.endswith(":USDT") or s.endswith(":USDC"): return s
     if "/USDT" in s and not s.endswith(":USDT"): return s + ":USDT"
     return s
 
-# ======================= Exchange =======================
+# ======== Exchange ========
 def make_exchange():
     return ccxt.bingx({
         "apiKey": API_KEY,
@@ -75,7 +68,7 @@ def make_exchange():
 
 ex = make_exchange()
 
-# ======================= Market / Account =======================
+# ======== Market / Account ========
 def balance_usdt():
     try:
         b = ex.fetch_balance(params={"type":"swap"})
@@ -100,8 +93,8 @@ def market_amount(amount):
     except Exception:
         return float(amount)
 
-# ======================= Data / Indicators =======================
-def fetch_ohlcv(limit=400):
+# ======== Indicators (Wilder matching) ========
+def fetch_ohlcv(limit=300):
     rows = ex.fetch_ohlcv(safe_symbol(SYMBOL), timeframe=INTERVAL, limit=limit, params={"type":"swap"})
     df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
     return df
@@ -124,6 +117,51 @@ def rma(series: pd.Series, length: int):
 def ema(series: pd.Series, span: int):
     return series.ewm(span=span, adjust=False).mean()
 
+def compute_indicators(df: pd.DataFrame):
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+
+    ema20  = ema(c, 20)
+    ema50  = ema(c, 50)
+    ema200 = ema(c, 200)
+
+    # RSI(14) Wilder
+    change = c.diff()
+    gain = change.clip(lower=0)
+    loss = (-change.clip(upper=0))
+    avg_gain = rma(gain, 14)
+    avg_loss = rma(loss, 14).replace(0, 1e-12)
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    # ATR(14) Wilder
+    tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atr = rma(tr, 14)
+
+    # ADX(14) Wilder
+    up_move = h.diff()
+    dn_move = (-l.diff())
+    plus_dm  = ((up_move > dn_move) & (up_move > 0)) * up_move
+    minus_dm = ((dn_move > up_move) & (dn_move > 0)) * dn_move
+    tr14  = rma(tr, 14)
+    pdi14 = 100 * rma(plus_dm, 14) / tr14
+    mdi14 = 100 * rma(minus_dm, 14) / tr14
+    dx    = ( (pdi14 - mdi14).abs() / (pdi14 + mdi14).replace(0,1e-12) ) * 100
+    adx14 = rma(dx, 14)
+
+    last = lambda s: float(s.dropna().iloc[-1]) if s.dropna().size else None
+    prev = lambda s: float(s.dropna().iloc[-2]) if s.dropna().size > 1 else None
+
+    out = {
+        "price": last(c),
+        "ema20": last(ema20), "ema50": last(ema50), "ema200": last(ema200),
+        "ema20_prev": prev(ema20), "ema50_prev": prev(ema50),
+        "rsi": last(rsi), "adx": last(adx14), "atr": last(atr)
+    }
+    return out
+
+# ======== (جديد) مؤشرات إضافية لمحرك الإشارات ========
 def bollinger(c, length=20, mult=2.0):
     ma = c.rolling(length).mean()
     sd = c.rolling(length).std(ddof=0)
@@ -157,10 +195,9 @@ def supertrend_series(df, period=10, mult=3.0):
     return st, d
 
 def compute_indicators_closed(df: pd.DataFrame):
-    """نستخدم آخر شمعة مُغلقة لتفادي إشارات كاذبة"""
+    """نستخدم آخر شمعة مُغلقة لتأكيد الإشارات (15m)."""
     if df is None or len(df) < 210: return None
     c = df['close'].astype(float); h=df['high'].astype(float); l=df['low'].astype(float)
-
     ema20  = ema(c,20); ema50=ema(c,50); ema200=ema(c,200)
     change = c.diff(); gain=change.clip(lower=0); loss=(-change.clip(upper=0))
     avg_gain=rma(gain,14); avg_loss=rma(loss,14).replace(0,1e-12); rs=avg_gain/avg_loss
@@ -191,17 +228,18 @@ def compute_indicators_closed(df: pd.DataFrame):
         "bar_range": float((h.iloc[i]-l.iloc[i])),
     }
 
-# ======================= Signals (TC + PB + MR) =======================
+# ======== (جديد) محرك الإشارات + أسباب الرفض ========
+ADX_TREND = max(MIN_ADX, 22)  # ترند قوي
+ADX_RANGE = 18                 # رينج
+ATR_BREAKER_PCT = 3.0
+SPIKE_MULT = 2.0
+
 def signal_with_reason(ind):
-    """
-    يرجع: (side, engine_tag, reason_if_none)
-    side: "buy"/"sell"/None
-    """
     if not ind: return None, None, "indicators_not_ready"
     p=ind["price"]; e20=ind["ema20"]; e50=ind["ema50"]; e200=ind["ema200"]
     e20p=ind["ema20_prev"]; e50p=ind["ema50_prev"]; rsi=ind["rsi"]; adx=ind["adx"]
 
-    # قواطع
+    # قواطع السوق
     if ind.get("atr_pct") and ind["atr_pct"] >= ATR_BREAKER_PCT:
         return None, None, f"atr_breaker_{fmt(ind['atr_pct'],2)}%"
     if ind.get("atr") and ind.get("bar_range") and ind["bar_range"] > SPIKE_MULT*ind["atr"]:
@@ -211,7 +249,7 @@ def signal_with_reason(ind):
     trending = adx >= ADX_TREND
     ranging  = adx < ADX_RANGE
 
-    # Trend Continuation (قطع/بولباك + Supertrend + RSI)
+    # Trend Continuation (TC)
     if trending and p and e20 and e50 and e200:
         long_ok  = (p>e200) and (e20>e50) and (ind["st_dir"]==1) and (rsi is not None and rsi>RSI_LONG_TH)
         short_ok = (p<e200) and (e20<e50) and (ind["st_dir"]==-1) and (rsi is not None and rsi<RSI_SHORT_TH)
@@ -223,13 +261,13 @@ def signal_with_reason(ind):
         if short_ok and (cross_down or pb_short): return "sell","TC",None
         return None, None, "tc_filters_not_met"
 
-    # Pullback Scalps (ADX بين 18 و 22)
+    # Pullback Scalps (PB)
     if (ADX_RANGE <= adx < ADX_TREND) and p and e20 and e50:
         if p>e50 and rsi and rsi>52 and p>e20:  return "buy","PB",None
         if p<e50 and rsi and rsi<48 and p<e20:  return "sell","PB",None
         return None, None, "pb_filters_not_met"
 
-    # Mean Reversion (رينج صريح)
+    # Mean Reversion (MR)
     if ranging and ind["bb_l"] and ind["bb_u"] and rsi is not None:
         if p<=ind["bb_l"] and rsi<35: return "buy","MR",None
         if p>=ind["bb_u"] and rsi>65: return "sell","MR",None
@@ -237,17 +275,48 @@ def signal_with_reason(ind):
 
     return None, None, "market_state_undefined"
 
-# ======================= Risk Sizing / Helpers =======================
-def compute_size_risk(balance, entry, sl):
-    if not balance or not entry or not sl: return 0.0
-    risk_usdt = balance * RISK_PCT
-    stop_dist = abs(entry - sl)
-    if stop_dist <= 0: return 0.0
-    qty = (risk_usdt / stop_dist) * LEVERAGE / entry
-    return market_amount(qty)
+def signal_balanced(ind):
+    # نحافظ على توقيع الدالة—ترجع side فقط
+    side, _, _ = signal_with_reason(ind)
+    return side
+
+# ======== State ========
+state = {"open": False, "side": None, "entry": None, "qty": None, "tp": None, "sl": None, "pnl": 0.0}
+compound_pnl = 0.0
+cool_bars = 0
+latest_bar_ts = None
+latest_indicators = {}
+
+# ======== Snapshot ========
+def snapshot(balance, price, ind, pos, total_pnl):
+    print()
+    log(SEP, "cyan")
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    log(f"{IC_HDR} SNAPSHOT • {now} • mode={TRADE_MODE.upper()} • {safe_symbol(SYMBOL)} • {INTERVAL}", "cyan")
+    log("—", "cyan")
+    log(f"{IC_BAL} Balance (USDT): {fmt(balance,2)}", "yellow")
+    log(f"{IC_PRC} Price          : {fmt(price,6)}", "green")
+    if ind:
+        log(f"{IC_EMA} EMA20/50/200  : {fmt(ind.get('ema20'),6)} / {fmt(ind.get('ema50'),6)} / {fmt(ind.get('ema200'),6)}", "blue")
+        log(f"{IC_RSI} RSI(14)       : {fmt(ind.get('rsi'),2)}", "magenta")
+        log(f"{IC_ADX} ADX(14)       : {fmt(ind.get('adx'),2)}", "magenta")
+        atrp = ind.get('atr_pct')
+        log(f"{IC_ATR} ATR(14)       : {fmt(ind.get('atr'),6)}  | ATR%={fmt(atrp,2)}", "magenta")
+    if pos["open"]:
+        side = pos["side"].upper()
+        log(f"{IC_POS} Position      : {side} | entry={fmt(pos['entry'],6)} qty={fmt(pos['qty'],4)}", "white")
+        log(f"{IC_TP}/{IC_SL} TP / SL       : {fmt(pos['tp'],6)} / {fmt(pos['sl'],6)}", "white")
+        log(f"📈 PnL current  : {fmt(pos['pnl'],6)}", "white")
+    log(f"📦 Compound PnL : {fmt(total_pnl,6)}", "yellow")
+    log(SEP, "cyan")
+
+# ======== Sizing / Helpers ========
+def compute_size(balance, price):
+    if not balance or not price: return 0
+    raw = (balance * RISK_ALLOC * LEVERAGE) / price
+    return market_amount(raw)
 
 def attach_protection(side_opp, qty, tp, sl):
-    """ضع TP/SL كـ reduceOnly. حاول أكثر من طريقة."""
     try:
         ex.create_order(safe_symbol(SYMBOL), "take_profit_market", side_opp, qty,
                         params={"reduceOnly": True, "takeProfitPrice": tp})
@@ -264,6 +333,7 @@ def attach_protection(side_opp, qty, tp, sl):
             return False
 
 def verify_oco(side_opp):
+    """تحقق أن SL و TP اتعلقوا فعلاً. حماية إضافية بدون تغيير السلوك المالي."""
     try:
         oo = ex.fetch_open_orders(symbol=safe_symbol(SYMBOL))
         tp_ok = any("take" in (o.get("type","").lower()) and o.get("side","").lower()==side_opp for o in oo)
@@ -272,67 +342,10 @@ def verify_oco(side_opp):
     except Exception as e:
         log(f"{IC_SHD} verify_oco error: {e}", "yellow"); return False
 
-def cancel_all_open_orders():
-    try:
-        for o in ex.fetch_open_orders(symbol=safe_symbol(SYMBOL)):
-            try: ex.cancel_order(o['id'], symbol=safe_symbol(SYMBOL))
-            except Exception: pass
-    except Exception: pass
-
-# ======================= State / Snapshot =======================
-state = {"open": False, "side": None, "entry": None, "qty": None, "tp": None, "sl": None, "pnl": 0.0}
-compound_pnl = 0.0
-cool_bars = 0
-latest_bar_ts = None
-latest_indicators = {}
-block_dir = None
-block_bars_left = 0
-
-def snapshot(balance, price, ind, pos, total_pnl):
-    print()
-    log(SEP, "cyan")
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    log(f"{IC_HDR} SNAPSHOT • {now} • mode={TRADE_MODE.upper()} • {safe_symbol(SYMBOL)} • {INTERVAL}", "cyan")
-    log("—", "cyan")
-    log(f"{IC_BAL} Balance (USDT): {fmt(balance,2)}", "yellow")
-    log(f"{IC_PRC} Price          : {fmt(price,6)}", "green")
-    if ind:
-        log(f"{IC_EMA} EMA20/50/200  : {fmt(ind.get('ema20'),6)} / {fmt(ind.get('ema50'),6)} / {fmt(ind.get('ema200'),6)}", "blue")
-        log(f"{IC_RSI} RSI(14)       : {fmt(ind.get('rsi'),2)}", "magenta")
-        log(f"{IC_ADX} ADX(14)       : {fmt(ind.get('adx'),2)}", "magenta")
-        log(f"{IC_ATR} ATR(14)       : {fmt(ind.get('atr'),6)}  | ATR%={fmt(ind.get('atr_pct'),2)}", "magenta")
-    if pos["open"]:
-        side = pos["side"].upper()
-        log(f"{IC_POS} Position      : {side} | entry={fmt(pos['entry'],6)} qty={fmt(pos['qty'],4)}", "white")
-        log(f"{IC_TP}/{IC_SL} TP / SL       : {fmt(pos['tp'],6)} / {fmt(pos['sl'],6)}", "white")
-        log(f"📈 PnL current  : {fmt(pos['pnl'],6)}", "white")
-    log(f"📦 Compound PnL : {fmt(total_pnl,6)}", "yellow")
-    log(SEP, "cyan")
-
-# ======================= Open / Close / Trailing =======================
-def update_trailing(px, ind):
-    if not state["open"] or not px or not ind: return
-    atr = ind.get("atr"); stl = ind.get("st_line")
-    if not atr: return
-    if state["side"]=="long":
-        gain = px - state["entry"]; be = state["entry"] + 0.1*atr
-        if gain >= 1.0*atr and state["sl"] < be:
-            state["sl"] = be; log("🔒 move SL → BE", "yellow")
-        trail = max(stl, px - 1.0*atr) if stl else (px - 1.0*atr)
-        if trail > state["sl"]:
-            state["sl"] = trail; log(f"↗️ trail SL {fmt(state['sl'],6)}","yellow")
-    else:
-        gain = state["entry"] - px; be = state["entry"] - 0.1*atr
-        if gain >= 1.0*atr and state["sl"] > be:
-            state["sl"] = be; log("🔒 move SL → BE", "yellow")
-        trail = min(stl, px + 1.0*atr) if stl else (px + 1.0*atr)
-        if trail < state["sl"]:
-            state["sl"] = trail; log(f"↘️ trail SL {fmt(state['sl'],6)}","yellow")
-
+# ======== Open / Close ========
 def place_protected_order(side, qty, ref_price, atr=None):
-    """يدخل الصفقة + يرفق SL/TP + يتحقق منهم، وإلا يلغي الدخول فورًا."""
     global state
-    # مستويات من ATR (افتراضي 1.2/1.8)
+    # SL/TP من ATR أو fallback ~1.5%
     if not atr or atr <= 0:
         sl = ref_price * (0.985 if side=="buy" else 1.015)
         tp = ref_price * (1.015 if side=="buy" else 0.985)
@@ -340,7 +353,6 @@ def place_protected_order(side, qty, ref_price, atr=None):
         sl = ref_price - 1.2*atr if side=="buy" else ref_price + 1.2*atr
         tp = ref_price + 1.8*atr if side=="buy" else ref_price - 1.8*atr
 
-    # PAPER
     if TRADE_MODE == "paper":
         state.update({"open": True, "side": "long" if side=="buy" else "short",
                       "entry": ref_price, "qty": qty, "tp": tp, "sl": sl, "pnl": 0.0})
@@ -348,7 +360,6 @@ def place_protected_order(side, qty, ref_price, atr=None):
         log(f"{IC_TRD} {tag} [PAPER] qty={fmt(qty,4)} entry={fmt(ref_price,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
         return
 
-    # LIVE
     try:
         ex.set_leverage(LEVERAGE, safe_symbol(SYMBOL), params={"side":"BOTH"})
     except Exception as e:
@@ -356,11 +367,12 @@ def place_protected_order(side, qty, ref_price, atr=None):
 
     try:
         ex.create_order(safe_symbol(SYMBOL), "market", side, qty, params={"reduceOnly": False})
-        log(f"{IC_TRD} submit {('🟢 BUY' if side=='buy' else '🔴 SELL')} qty={fmt(qty,4)}", "green")
+        tag = "🟢 BUY" if side=="buy" else "🔴 SELL"
+        log(f"{IC_TRD} submit {tag} qty={fmt(qty,4)}", "green")
     except Exception as e:
         log(f"{IC_BAD} open error: {e}", "red"); return
 
-    # تحقق/إرفاق حماية
+    # تحقق بعد التنفيذ + تحقق OCO
     try:
         time.sleep(0.9)
         poss = ex.fetch_positions([safe_symbol(SYMBOL)], params={"type":"swap"})
@@ -384,15 +396,14 @@ def place_protected_order(side, qty, ref_price, atr=None):
 
         state.update({"open": True, "side": "long" if side=="buy" else "short",
                       "entry": entry, "qty": size, "tp": tp, "sl": sl, "pnl": 0.0})
-        tag = IC_BUY if side=="buy" else IC_SELL
-        log(f"{IC_TRD} {tag} CONFIRMED qty={fmt(size,4)} entry={fmt(entry,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
+        tag2 = IC_BUY if side=="buy" else IC_SELL
+        log(f"{IC_TRD} {tag2} CONFIRMED qty={fmt(size,4)} entry={fmt(entry,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
 
     except Exception as e:
         log(f"{IC_BAD} post-trade validation error: {e}", "red")
 
 def close_position(reason):
-    """يغلق المركز + ينظّف أوامر OCO + يحدّث البلوك/الكوولداون"""
-    global state, compound_pnl, cool_bars, block_dir, block_bars_left
+    global state, compound_pnl, cool_bars
     if not state["open"]: return
     px   = price_now() or state["entry"]
     qty  = state["qty"]
@@ -407,90 +418,68 @@ def close_position(reason):
             log(f"{IC_BAD} close error: {e}", "red")
         pnl = (px - state["entry"]) * qty * (1 if state["side"]=="long" else -1)
 
-    cancel_all_open_orders()
     compound_pnl += pnl
-    log(f"{IC_CLS} Close {state['side'].upper()} reason={reason} pnl={fmt(pnl,6)} total={fmt(compound_pnl,6)}","magenta")
-    if reason == "sl":
-        block_dir = state["side"]; block_bars_left = max(block_bars_left, COOLDOWN_BARS if COOLDOWN_BARS>1 else 2)
-
+    log(f"{IC_CLS} Close {state['side']} reason={reason} pnl={fmt(pnl,6)} total={fmt(compound_pnl,6)}","magenta")
     state.update({"open": False, "side": None, "entry": None, "qty": None, "tp": None, "sl": None, "pnl": 0.0})
     cool_bars = COOLDOWN_BARS
 
-# ======================= Main Loop =======================
+# ======== Main loop ========
 def trade_loop():
-    global state, compound_pnl, cool_bars, latest_bar_ts, latest_indicators, block_dir, block_bars_left
-    log(f"{IC_OK} Trading loop started on {safe_symbol(SYMBOL)} @ {INTERVAL}", "cyan")
+    global state, compound_pnl, cool_bars, latest_bar_ts, latest_indicators
     while True:
         try:
-            df = fetch_ohlcv()
-            if df is None or len(df) < 210:
-                log(f"{IC_SHD} no_entry: insufficient_bars", "yellow"); time.sleep(30); continue
+            bal = balance_usdt()
+            px  = price_now()
+            df  = fetch_ohlcv()
+            # نستخدم المؤشرات على الشمعة المُغلقة لضبط الإشارات
+            ind_closed = compute_indicators_closed(df) if df is not None and len(df) > 220 else None
+            ind = ind_closed or (compute_indicators(df) if df is not None else {})
+            latest_indicators = ind if ind else {}
+            side, engine_tag, no_reason = signal_with_reason(ind)  # سبب الرفض
 
-            bar_ts = int(df['time'].iloc[-2])  # آخر شمعة مغلقة
-            new_bar = (latest_bar_ts is None) or (bar_ts != latest_bar_ts)
+            # تحديث PnL الجاري
+            if state["open"] and px:
+                if state["side"]=="long":
+                    state["pnl"] = (px - state["entry"]) * state["qty"]
+                else:
+                    state["pnl"] = (state["entry"] - px) * state["qty"]
 
-            # تحديث PnL الحالي
-            px_now = price_now()
-            if state["open"] and px_now:
-                state["pnl"] = (px_now - state["entry"]) * state["qty"] if state["side"]=="long" else (state["entry"] - px_now) * state["qty"]
+            snapshot(bal, px, ind or {}, state.copy(), compound_pnl)
 
-            if new_bar:
-                latest_indicators = compute_indicators_closed(df)
-                latest_bar_ts = bar_ts
+            if cool_bars > 0:
+                cool_bars -= 1
+                log(f"{IC_SHD} cooldown bars left: {cool_bars}", "yellow")
+                time.sleep(60); continue
 
-                bal = balance_usdt(); px = price_now()
-                snapshot(bal, px, latest_indicators, state.copy(), compound_pnl)
+            # دخول محمي
+            if not state["open"] and px and bal and ind:
+                ref = ind.get("price")
+                if side is None:
+                    log(f"{IC_SHD} no_entry: {no_reason}", "yellow")
+                elif ref and abs(px - ref)/ref <= MAX_SLIPPAGE_PCT:
+                    qty = compute_size(bal, px)  # كما هو: 60% × 10x
+                    atr = ind.get("atr")
+                    tag = IC_BUY if side=="buy" else IC_SELL
+                    log(f"{IC_TRD} {tag} signal engine={engine_tag} qty={fmt(qty,4)} entry={fmt(px,6)}", "green")
+                    if qty and qty > 0:
+                        place_protected_order(side, qty, px, atr=atr)
+                        cool_bars = COOLDOWN_BARS
+                else:
+                    log(f"{IC_SHD} no_entry: slippage px={fmt(px,6)} ref={fmt(ref,6)}","yellow")
 
-                # عدادات بالشموع
-                if cool_bars > 0: cool_bars -= 1
-                if block_bars_left > 0: block_bars_left -= 1
-
-                # Trailing عند إغلاق الشمعة
-                if state["open"] and px: update_trailing(px, latest_indicators)
-
-                # قرارات الدخول على الشمعة المغلقة فقط
-                if not state["open"] and cool_bars == 0:
-                    side_sig, engine, no_reason = signal_with_reason(latest_indicators)
-                    if side_sig is None:
-                        log(f"{IC_SHD} no_entry: {no_reason}", "yellow")
-                    else:
-                        # حظر الاتجاه بعد خسارة
-                        if block_bars_left>0 and ((block_dir=="long" and side_sig=="buy") or (block_dir=="short" and side_sig=="sell")):
-                            log(f"{IC_SHD} no_entry: blocked_after_loss dir={block_dir} bars_left={block_bars_left}", "yellow")
-                        else:
-                            ref = latest_indicators["price"]; px = price_now(); bal = balance_usdt()
-                            if not (px and ref and bal):
-                                log(f"{IC_SHD} no_entry: px_or_balance_na", "yellow")
-                            elif abs(px-ref)/ref > MAX_SLIPPAGE_PCT:
-                                log(f"{IC_SHD} no_entry: slippage px={fmt(px,6)} ref={fmt(ref,6)}", "yellow")
-                            else:
-                                atr = latest_indicators.get("atr") or 0
-                                sl = (px - 1.2*atr) if side_sig=="buy" else (px + 1.2*atr)
-                                tp = (px + 1.8*atr) if side_sig=="buy" else (px - 1.8*atr)
-                                qty = compute_size_risk(bal, px, sl)
-                                if qty and qty > 0:
-                                    tag = IC_BUY if side_sig=="buy" else IC_SELL
-                                    log(f"{IC_TRD} {tag} signal engine={engine} qty={fmt(qty,4)} entry={fmt(px,6)} tp={fmt(tp,6)} sl={fmt(sl,6)}", "green")
-                                    place_protected_order(side_sig, qty, px, atr=atr)
-                                    cool_bars = COOLDOWN_BARS
-                                else:
-                                    log(f"{IC_SHD} no_entry: qty_zero risk_pct={RISK_PCT}", "yellow")
-            else:
-                # أثناء تكوّن الشمعة: متابعة Trailing وSoft-guards
-                px = price_now()
-                if state["open"] and px:
-                    update_trailing(px, latest_indicators)
-                    if state["side"]=="long" and (px <= state["sl"] or px >= state["tp"]):
-                        close_position("tp" if px >= state["tp"] else "sl")
-                    elif state["side"]=="short" and (px >= state["sl"] or px <= state["tp"]):
-                        close_position("tp" if px <= state["tp"] else "sl")
+            # Soft-guard لمس TP/SL
+            if state["open"] and px:
+                if state["side"]=="long" and (px <= state["sl"] or px >= state["tp"]):
+                    close_position("tp" if px >= state["tp"] else "sl")
+                elif state["side"]=="short" and (px >= state["sl"] or px <= state["tp"]):
+                    close_position("tp" if px <= state["tp"] else "sl")
 
         except Exception as e:
             log(f"{IC_BAD} loop error: {e}", "red")
 
-        time.sleep(5)  # قرارات الدخول على إغلاق الشموع فقط
+        time.sleep(60)  # 1m tick for 15m strategy
 
-# ======================= Keepalive =======================
+# ======== Keepalive ========
 def keepalive_loop():
     if not SELF_URL:
         log("SELF_URL not set — keepalive disabled", "yellow"); return
@@ -500,12 +489,12 @@ def keepalive_loop():
         except Exception: pass
         time.sleep(50)
 
-# ======================= Flask (Dashboard) =======================
+# ======== Flask ========
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return f"{IC_OK} Bot Running — Signals OCO Protected — {safe_symbol(SYMBOL)} {INTERVAL}"
+    return f"{IC_OK} Bot Running — Dashboard Active"
 
 @app.route("/metrics")
 def metrics():
@@ -514,9 +503,7 @@ def metrics():
         "interval": INTERVAL,
         "mode": TRADE_MODE,
         "leverage": LEVERAGE,
-        "risk_pct": RISK_PCT,
-        "min_adx": MIN_ADX,
-        "cooldown_bars": COOLDOWN_BARS,
+        "risk_alloc": RISK_ALLOC,
         "balance": balance_usdt(),
         "price": price_now(),
         "position": state,
@@ -524,7 +511,7 @@ def metrics():
         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     })
 
-# ======================= Boot =======================
+# ======== Boot ========
 threading.Thread(target=trade_loop, daemon=True).start()
 threading.Thread(target=keepalive_loop, daemon=True).start()
 
