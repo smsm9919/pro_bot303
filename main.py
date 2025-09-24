@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-BingX Futures LIVE (15m) — Robust Strategy (EMA5/15 + RSI + MACD + BB + EMA200)
-+ False-Signal Guards (ADX/ATR-body/EMA confirm) + Optional Reverse-on-Signal
+MIME BAY — BingX Futures LIVE (15m)
+Robust Strategy (EMA5/15 + RSI + MACD + BB + EMA200)
++ False-Signal Guards (ADX/ATR-body/EMA confirm) + Reverse-on-Signal (2–3m confirm)
 + OCO Verification + Color-coded Logs by Position
 
-ملاحظة مهمة:
+IMPORTANT:
 - لا تغيير في الدوال الأساسية للمنصة/الرصيد/الحجم/Flask/KeepAlive.
 - كل التعديلات داخل الاستراتيجية والحماية والـ logs فقط.
 """
@@ -21,7 +22,7 @@ load_dotenv()
 SYMBOL       = os.getenv("SYMBOL", "DOGE/USDT:USDT")
 INTERVAL     = os.getenv("INTERVAL", "15m")
 LEVERAGE     = int(float(os.getenv("LEVERAGE", "10")))
-RISK_ALLOC   = float(os.getenv("RISK_ALLOC", "0.60"))   # 60% of balance (كما هو)
+RISK_ALLOC   = float(os.getenv("RISK_ALLOC", "0.60"))   # 60% of balance
 TRADE_MODE   = os.getenv("TRADE_MODE", "live").lower()  # live/paper
 SELF_URL     = os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("SELF_URL", "")
 
@@ -41,6 +42,13 @@ MIN_BODY_ATR    = float(os.getenv("MIN_BODY_ATR", "0.20"))  # جسم الشمع�
 # — توافق مع TradingView (اختياري) —
 USE_TV_BAR      = os.getenv("USE_TV_BAR", "false").lower() == "true" # true = استخدم الشمعة الحالية
 RSI_LEN_MAIN    = int(os.getenv("RSI_LEN_MAIN", "7"))                # طول RSI (6/7)
+
+# — عكس مُؤكَّد —
+REV_CONFIRM_SECONDS = int(os.getenv("REV_CONFIRM_SECONDS", "180"))   # 2–3 دقائق
+REV_REQUIRE_CONSEC  = int(os.getenv("REV_REQUIRE_CONSEC",  "2"))     # قراءات متتالية أثناء الانتظار
+
+# — Circuit breaker —
+CIRCUIT_BREAKER_ATR_PCT = float(os.getenv("CIRCUIT_BREAKER_ATR_PCT", "3.0")) # تجميد لو ATR% مرتفع
 
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
@@ -63,9 +71,9 @@ def log(msg, color="white"):
 def log_trade(msg, base_color="white"):
     if state.get("open"):
         if state["side"] == "long":
-            return log(msg, "green")   # كل اللوجز أخضر أثناء BUY
+            return log(msg, "green")
         elif state["side"] == "short":
-            return log(msg, "red")     # كل اللوجز أحمر أثناء SELL
+            return log(msg, "red")
     return log(msg, base_color)
 
 def fmt(v, d=2, na="N/A"):
@@ -75,9 +83,11 @@ def fmt(v, d=2, na="N/A"):
     except Exception:
         return na
 
-def safe_symbol(s: str) -> str:
+def safe_symbol(s: str):
+    # FIXED: كان فيه "::USDT"
     if s.endswith(":USDT") or s.endswith(":USDC"): return s
-    if "/USDT" in s and not s.endswith("::USDT"): return s + ":USDT"
+    if "/USDT" in s and not s.endswith(":USDT"):
+        return s + ":USDT"
     return s
 
 # ======== Exchange (كما هو) ========
@@ -90,6 +100,10 @@ def make_exchange():
         "options": {"defaultType": "swap", "defaultMarginMode": "isolated"}
     })
 ex = make_exchange()
+try:
+    ex.load_markets()
+except Exception:
+    pass
 
 # ======== Market / Account (كما هي) ========
 def balance_usdt():
@@ -153,26 +167,32 @@ def bollinger(c, length=20, mult=2.0):
     lower = ma - mult*sd
     return ma, upper, lower
 
-# ======== Indicators on closed/current bar (حسب USE_TV_BAR) ========
+# ======== Indicators (Wilder دقيق) ========
 def compute_indicators(df: pd.DataFrame):
     if df is None or len(df) < 210: return None
     o = df['open'].astype(float); h=df['high'].astype(float)
-    l=df['low'].astype(float); c = df['close'].astype(float)
+    l=df['low'].astype(float);  c = df['close'].astype(float)
 
     ema_fast = ema(c, 5); ema_slow = ema(c, 15); ema200 = ema(c, 200)
 
-    # RSI بطول RSI_LEN_MAIN (Wilder)
+    # RSI (Wilder)
     change = c.diff(); gain=change.clip(lower=0); loss=(-change.clip(upper=0))
     avg_gain=rma(gain,RSI_LEN_MAIN); avg_loss=rma(loss,RSI_LEN_MAIN).replace(0,1e-12)
     rs=avg_gain/avg_loss; rsi = 100 - (100/(1+rs))
 
-    # ATR/ADX
-    tr = pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    atr = rma(tr,14)
-    up=h.diff(); dn=-l.diff()
-    plus_dm=((up>dn)&(up>0))*up; minus_dm=((dn>up)&(dn>0))*dn
-    tr14=rma(tr,14); pdi14=100*rma(plus_dm,14)/tr14; mdi14=100*rma(minus_dm,14)/tr14
-    dx=( (pdi14-mdi14).abs()/(pdi14+mdi14).replace(0,1e-12) )*100; adx=rma(dx,14)
+    # ATR (Wilder)
+    tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    atr = rma(tr, 14)
+
+    # ADX (Wilder) — FIXED
+    up = h.diff(); dn = -l.diff()
+    plus_dm  = ((up > dn) & (up > 0)) * up
+    minus_dm = ((dn > up) & (dn > 0)) * dn
+    tr14  = rma(tr, 14)
+    pdi14 = 100 * rma(plus_dm, 14) / tr14
+    mdi14 = 100 * rma(minus_dm, 14) / tr14
+    dx    = ( (pdi14 - mdi14).abs() / (pdi14 + mdi14).replace(0, 1e-12) ) * 100
+    adx   = rma(dx, 14)
 
     macd_line, macd_signal, _ = macd_series(c, 12, 26, 9)
     bb_mid, bb_u, bb_l = bollinger(c, 20, 2.0)
@@ -197,7 +217,7 @@ def compute_indicators(df: pd.DataFrame):
 
 # ======== Strategy Signals ========
 def signal_core(ind):
-    """شروط الاستراتيجية الأساسية (مطابقة للصورة):"""
+    """شروط الاستراتيجية الأساسية (EMA5/15 + RSI + MACD + BB + EMA200)."""
     if not ind: return None, "indicators_not_ready"
     need = ["price","ema_fast","ema_slow","ema_fast_prev","ema_slow_prev","ema200","rsi","bb_l","bb_u","macd","macd_signal"]
     if any(ind.get(k) is None for k in need):
@@ -228,7 +248,6 @@ def signal_core(ind):
     if cond_buy:  return "buy",  None
     if cond_sell: return "sell", None
 
-    # أسباب عامة لعدم الدخول
     reasons=[]
     if not (emaCrossBuy or emaCrossSell): reasons.append("no_ema_cross")
     if RSI_LONG_TH <= ind["rsi"] <= RSI_SHORT_TH: reasons.append("rsi_neutral")
@@ -272,6 +291,30 @@ def signal_balanced(ind):
     log_trade(f"{IC_TRD} {tag} signal ready", "green")
     return side
 
+# ======== Reverse Manager (تأكيد 2–3 دقائق) ========
+reverse_pending = {"active": False, "to": None, "since": 0, "hits": 0}
+
+def start_reverse(to_side: str):
+    reverse_pending.update({"active": True, "to": to_side, "since": int(time.time()), "hits": 0})
+    log_trade(f"🌀 reverse_started → {to_side}", "yellow")
+
+def feed_reverse(current_signal: str) -> bool:
+    if not reverse_pending["active"]: return False
+    # accumulate consecutive confirmations
+    if current_signal == reverse_pending["to"]:
+        reverse_pending["hits"] += 1
+    else:
+        reverse_pending["hits"] = 0
+    enough_time = int(time.time()) - reverse_pending["since"] >= REV_CONFIRM_SECONDS
+    if enough_time and reverse_pending["hits"] >= REV_REQUIRE_CONSEC:
+        return True
+    return False
+
+def end_reverse(msg="done"):
+    if reverse_pending["active"]:
+        log_trade(f"🌀 reverse_end: {msg}", "yellow")
+    reverse_pending.update({"active": False, "to": None, "since": 0, "hits": 0})
+
 # ======== State ========
 state = {"open": False, "side": None, "entry": None, "qty": None, "tp": None, "sl": None, "pnl": 0.0}
 compound_pnl = 0.0
@@ -281,7 +324,7 @@ def snapshot(balance, price, ind, pos, total_pnl):
     print()
     log_trade(SEP, "cyan")
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    log_trade(f"{IC_HDR} SNAPSHOT • {now} • mode={TRADE_MODE.upper()} • {safe_symbol(SYMBOL)} • {INTERVAL}", "cyan")
+    log_trade(f"{IC_HDR} SNAPSHOT • {now} • mode={TRADE_MODE.UPPER()} • {safe_symbol(SYMBOL)} • {INTERVAL}", "cyan")
     log_trade("—", "cyan")
     log_trade(f"{IC_BAL} Balance (USDT): {fmt(balance,2)}", "yellow")
     log_trade(f"{IC_PRC} Price          : {fmt(price,6)}", "green")
@@ -426,35 +469,50 @@ def trade_loop():
 
             snapshot(bal, px, ind or {}, state.copy(), compound_pnl)
 
+            # Circuit breaker (تقلب مفرط)
+            if ind and ind.get("atr") and ind.get("price"):
+                atr_pct = (ind["atr"] / ind["price"]) * 100.0
+                if atr_pct >= CIRCUIT_BREAKER_ATR_PCT:
+                    log_trade("🛑 circuit_breaker: high volatility", "yellow")
+                    time.sleep(60); continue
+
             if cool_bars > 0:
                 cool_bars -= 1
                 log_trade(f"{IC_SHD} cooldown bars left: {cool_bars}", "yellow")
                 time.sleep(60); continue
 
-            # لا قرارات بدون مؤشرات
+            # لا قرارات بدون مؤشرات أو بيانات
             if not ind or not (px and bal):
                 time.sleep(60); continue
 
             # توليد إشارة بعد الفلاتر
             side = signal_balanced(ind)
 
-            # === Reverse on Signal (Flip) مع الحماية من الإشارات الكاذبة ===
+            # Flip مؤكد: اغلاق فوري + انتظار تأكيد 2–3 دق قبل فتح العكس
             if USE_REVERSE and state["open"] and side:
                 opposite = (state["side"]=="long" and side=="sell") or (state["side"]=="short" and side=="buy")
                 if opposite:
-                    # إغلاق الحالي + فتح العكسي بنفس منطق الحجم
-                    close_position("reverse_signal")
-                    qty = compute_size(bal, px)
-                    log_trade(f"{IC_TRD} flip_to_{side} qty={fmt(qty,4)} entry={fmt(px,6)}", "green")
-                    place_protected_order(side, qty, px, atr=ind.get("atr"))
-                    cool_bars = COOLDOWN_BARS
-                    time.sleep(60); continue  # انتظر الشمعة التالية
+                    close_position("signal_flip")
+                    start_reverse(side)
+
+            # تنفيذ الـ Reverse بعد التأكيد (مع slippage guard)
+            if reverse_pending["active"]:
+                if feed_reverse(side):
+                    ref = ind.get("price") or px
+                    if abs(px - ref)/ref <= MAX_SLIPPAGE_PCT:
+                        qty = compute_size(bal, px)
+                        place_protected_order(reverse_pending["to"], qty, px, atr=ind.get("atr"))
+                        end_reverse("opened")
+                        cool_bars = COOLDOWN_BARS
+                        time.sleep(60); continue
+                    else:
+                        log_trade(f"{IC_SHD} reverse blocked: slippage", "yellow")
 
             # دخول عادي (بدون مركز مفتوح)
             if not state["open"] and side:
                 ref = ind.get("price")
                 if ref and abs(px - ref)/ref <= MAX_SLIPPAGE_PCT:
-                    qty = compute_size(bal, px)  # 60% × 10x كما هو
+                    qty = compute_size(bal, px)
                     if qty and qty > 0:
                         log_trade(f"{IC_TRD} {(IC_BUY if side=='buy' else IC_SELL)} qty={fmt(qty,4)} entry={fmt(px,6)}", "green")
                         place_protected_order(side, qty, px, atr=ind.get("atr"))
