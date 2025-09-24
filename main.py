@@ -5,9 +5,9 @@ Robust Strategy (EMA5/15 + RSI + MACD + BB + EMA200)
 + False-Signal Guards (ADX/ATR-body/EMA confirm) + Reverse-on-Signal (2–3m confirm)
 + OCO Verification + Color-coded Logs by Position
 
-IMPORTANT:
-- لا تغيير في الدوال الأساسية للمنصة/الرصيد/الحجم/Flask/KeepAlive.
-- كل التعديلات داخل الاستراتيجية والحماية والـ logs فقط.
+مهم:
+- لا نلمس دوال المنصّة/الرصيد/الحجم/Flask/KeepAlive.
+- كل التعديلات داخل الاستراتيجية والحمايات والـ logs فقط.
 """
 
 import os, time, math, threading, requests
@@ -22,33 +22,33 @@ load_dotenv()
 SYMBOL       = os.getenv("SYMBOL", "DOGE/USDT:USDT")
 INTERVAL     = os.getenv("INTERVAL", "15m")
 LEVERAGE     = int(float(os.getenv("LEVERAGE", "10")))
-RISK_ALLOC   = float(os.getenv("RISK_ALLOC", "0.60"))   # 60% of balance
-TRADE_MODE   = os.getenv("TRADE_MODE", "live").lower()  # live/paper
+RISK_ALLOC   = float(os.getenv("RISK_ALLOC", "0.60"))         # 60% من الرصيد
+TRADE_MODE   = os.getenv("TRADE_MODE", "live").lower()        # live/paper
 SELF_URL     = os.getenv("RENDER_EXTERNAL_URL", "") or os.getenv("SELF_URL", "")
 
-# — مؤشرات/حدود (قابلة للضبط من .env) —
-RSI_LONG_TH      = float(os.getenv("RSI_LONG_TH", "35"))  # شراء تحت 35
-RSI_SHORT_TH     = float(os.getenv("RSI_SHORT_TH", "65")) # بيع فوق 65
-MIN_ADX          = float(os.getenv("MIN_ADX", "18"))      # يُعرض في Snapshot فقط
+# — thresholds —
+RSI_LONG_TH      = float(os.getenv("RSI_LONG_TH", "35"))      # شراء تحت 35
+RSI_SHORT_TH     = float(os.getenv("RSI_SHORT_TH", "65"))     # بيع فوق 65
+MIN_ADX          = float(os.getenv("MIN_ADX", "18"))          # للعرض فقط
 MAX_SLIPPAGE_PCT = float(os.getenv("MAX_SLIPPAGE_PCT", "0.004"))  # 0.4%
 COOLDOWN_BARS    = int(os.getenv("COOLDOWN_BARS", "1"))
 
-# — حمايات ضد الإشارات الكاذبة —
-USE_REVERSE     = os.getenv("USE_REVERSE", "true").lower() == "true"  # قلب على الإشارة العكسية
-MIN_ADX_TRADE   = float(os.getenv("MIN_ADX_TRADE", "18"))   # أقل ADX للسماح بالتداول
-CONFIRM_PCT     = float(os.getenv("CONFIRM_PCT", "0.0015")) # 0.15% تأكيد فوق/تحت EMA slow
-MIN_BODY_ATR    = float(os.getenv("MIN_BODY_ATR", "0.20"))  # جسم الشمعة ≥ 20% من ATR
+# — guards —
+USE_REVERSE     = os.getenv("USE_REVERSE", "true").lower() == "true"
+MIN_ADX_TRADE   = float(os.getenv("MIN_ADX_TRADE", "18"))     # حدّ أدنى للـ ADX
+CONFIRM_PCT     = float(os.getenv("CONFIRM_PCT", "0.0015"))   # 0.15% فوق/تحت EMA slow
+MIN_BODY_ATR    = float(os.getenv("MIN_BODY_ATR", "0.20"))    # جسم الشمعة ≥ 20% من ATR
 
-# — توافق مع TradingView (اختياري) —
-USE_TV_BAR      = os.getenv("USE_TV_BAR", "false").lower() == "true" # true = استخدم الشمعة الحالية
-RSI_LEN_MAIN    = int(os.getenv("RSI_LEN_MAIN", "7"))                # طول RSI (6/7)
+# — توافق TradingView (اختياري) —
+USE_TV_BAR      = os.getenv("USE_TV_BAR", "false").lower() == "true"  # true = استخدم الشمعة الحالية
+RSI_LEN_MAIN    = int(os.getenv("RSI_LEN_MAIN", "7"))                 # 6/7
 
-# — عكس مُؤكَّد —
-REV_CONFIRM_SECONDS = int(os.getenv("REV_CONFIRM_SECONDS", "180"))   # 2–3 دقائق
-REV_REQUIRE_CONSEC  = int(os.getenv("REV_REQUIRE_CONSEC",  "2"))     # قراءات متتالية أثناء الانتظار
+# — Reverse confirm —
+REV_CONFIRM_SECONDS = int(os.getenv("REV_CONFIRM_SECONDS", "180"))    # 2–3 دقائق
+REV_REQUIRE_CONSEC  = int(os.getenv("REV_REQUIRE_CONSEC",  "2"))      # قراءات متتالية أثناء الانتظار
 
 # — Circuit breaker —
-CIRCUIT_BREAKER_ATR_PCT = float(os.getenv("CIRCUIT_BREAKER_ATR_PCT", "3.0")) # تجميد لو ATR% مرتفع
+CIRCUIT_BREAKER_ATR_PCT = float(os.getenv("CIRCUIT_BREAKER_ATR_PCT", "3.0"))
 
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
@@ -64,16 +64,12 @@ IC_POS="🧭"; IC_TP="🎯"; IC_SL="🛑"; IC_TRD="🟢"; IC_CLS="🔴"; IC_OK="
 IC_BUY="🟩 BUY"; IC_SELL="🟥 SELL"
 SEP = colored("—"*96, "cyan")
 
-def log(msg, color="white"):
-    print(colored(msg, color), flush=True)
+def log(msg, color="white"): print(colored(msg, color), flush=True)
 
-# تلوين اللوجز حسب اتجاه المركز المفتوح
 def log_trade(msg, base_color="white"):
     if state.get("open"):
-        if state["side"] == "long":
-            return log(msg, "green")
-        elif state["side"] == "short":
-            return log(msg, "red")
+        if state["side"] == "long":  return log(msg, "green")
+        if state["side"] == "short": return log(msg, "red")
     return log(msg, base_color)
 
 def fmt(v, d=2, na="N/A"):
@@ -84,13 +80,13 @@ def fmt(v, d=2, na="N/A"):
         return na
 
 def safe_symbol(s: str):
-    # FIXED: كان فيه "::USDT"
+    # FIX: كان فيها "::USDT"
     if s.endswith(":USDT") or s.endswith(":USDC"): return s
     if "/USDT" in s and not s.endswith(":USDT"):
         return s + ":USDT"
     return s
 
-# ======== Exchange (كما هو) ========
+# ======== Exchange ========
 def make_exchange():
     return ccxt.bingx({
         "apiKey": API_KEY,
@@ -100,12 +96,10 @@ def make_exchange():
         "options": {"defaultType": "swap", "defaultMarginMode": "isolated"}
     })
 ex = make_exchange()
-try:
-    ex.load_markets()
-except Exception:
-    pass
+try: ex.load_markets()
+except Exception: pass
 
-# ======== Market / Account (كما هي) ========
+# ======== Market / Account ========
 def balance_usdt():
     try:
         b = ex.fetch_balance(params={"type":"swap"})
@@ -130,15 +124,13 @@ def market_amount(amount):
     except Exception:
         return float(amount)
 
-# ======== Data / Wilder tools (كما هي) ========
+# ======== Data / Wilder tools ========
 def fetch_ohlcv(limit=400):
     rows = ex.fetch_ohlcv(safe_symbol(SYMBOL), timeframe=INTERVAL, limit=limit, params={"type":"swap"})
     return pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
 
 def rma(series: pd.Series, length: int):
-    alpha = 1.0 / float(length)
-    r = [None]*len(series)
-    s = series.astype(float).values
+    r = [None]*len(series); s = series.astype(float).values
     acc = 0.0; n = 0
     for i, v in enumerate(s):
         if pd.isna(v): r[i] = math.nan; continue
@@ -149,8 +141,7 @@ def rma(series: pd.Series, length: int):
             r[i] = (r[i-1]*(length-1) + v) / length
     return pd.Series(r, index=series.index, dtype="float64")
 
-def ema(series: pd.Series, span: int):
-    return series.ewm(span=span, adjust=False).mean()
+def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
 
 def macd_series(c, fast=12, slow=26, signal=9):
     ema_fast = c.ewm(span=fast, adjust=False).mean()
@@ -163,9 +154,7 @@ def macd_series(c, fast=12, slow=26, signal=9):
 def bollinger(c, length=20, mult=2.0):
     ma = c.rolling(length).mean()
     sd = c.rolling(length).std(ddof=0)
-    upper = ma + mult*sd
-    lower = ma - mult*sd
-    return ma, upper, lower
+    return ma, ma + mult*sd, ma - mult*sd
 
 # ======== Indicators (Wilder دقيق) ========
 def compute_indicators(df: pd.DataFrame):
@@ -184,7 +173,7 @@ def compute_indicators(df: pd.DataFrame):
     tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     atr = rma(tr, 14)
 
-    # ADX (Wilder) — FIXED
+    # ADX (Wilder) — صحيح
     up = h.diff(); dn = -l.diff()
     plus_dm  = ((up > dn) & (up > 0)) * up
     minus_dm = ((dn > up) & (dn > 0)) * dn
@@ -197,7 +186,7 @@ def compute_indicators(df: pd.DataFrame):
     macd_line, macd_signal, _ = macd_series(c, 12, 26, 9)
     bb_mid, bb_u, bb_l = bollinger(c, 20, 2.0)
 
-    # اختيار الشمعة
+    # الشمعة المستخدمة
     i = len(df)-1 if USE_TV_BAR else len(df)-2
     last = lambda s: float(s.iloc[i]) if not pd.isna(s.iloc[i]) else None
     prev = lambda s: float(s.iloc[i-1]) if not pd.isna(s.iloc[i-1]) else None
@@ -215,35 +204,19 @@ def compute_indicators(df: pd.DataFrame):
         "macd": last(macd_line), "macd_signal": last(macd_signal),
     }
 
-# ======== Strategy Signals ========
+# ======== Strategy ========
 def signal_core(ind):
-    """شروط الاستراتيجية الأساسية (EMA5/15 + RSI + MACD + BB + EMA200)."""
     if not ind: return None, "indicators_not_ready"
     need = ["price","ema_fast","ema_slow","ema_fast_prev","ema_slow_prev","ema200","rsi","bb_l","bb_u","macd","macd_signal"]
-    if any(ind.get(k) is None for k in need):
-        return None, "missing_indicators"
+    if any(ind.get(k) is None for k in need): return None, "missing_indicators"
 
     p = ind["price"]
-
-    # BUY: EMA5 cross up + RSI<35 + MACD>Signal + price<BB-L + price>EMA200
-    emaCrossBuy = (ind["ema_fast_prev"] <= ind["ema_slow_prev"]) and (ind["ema_fast"] > ind["ema_slow"])
-    cond_buy = all([
-        emaCrossBuy,
-        ind["rsi"] < RSI_LONG_TH,
-        ind["macd"] > ind["macd_signal"],
-        p < ind["bb_l"],
-        p > ind["ema200"]
-    ])
-
-    # SELL: EMA5 cross down + RSI>65 + MACD<Signal + price>BB-U + price<EMA200
+    # BUY
+    emaCrossBuy  = (ind["ema_fast_prev"] <= ind["ema_slow_prev"]) and (ind["ema_fast"] > ind["ema_slow"])
+    cond_buy  = all([emaCrossBuy, ind["rsi"] < RSI_LONG_TH,  ind["macd"] > ind["macd_signal"], p < ind["bb_l"], p > ind["ema200"]])
+    # SELL
     emaCrossSell = (ind["ema_fast_prev"] >= ind["ema_slow_prev"]) and (ind["ema_fast"] < ind["ema_slow"])
-    cond_sell = all([
-        emaCrossSell,
-        ind["rsi"] > RSI_SHORT_TH,
-        ind["macd"] < ind["macd_signal"],
-        p > ind["bb_u"],
-        p < ind["ema200"]
-    ])
+    cond_sell = all([emaCrossSell, ind["rsi"] > RSI_SHORT_TH, ind["macd"] < ind["macd_signal"], p > ind["bb_u"], p < ind["ema200"]])
 
     if cond_buy:  return "buy",  None
     if cond_sell: return "sell", None
@@ -254,65 +227,47 @@ def signal_core(ind):
     if abs(ind["macd"]-ind["macd_signal"])<1e-12: reasons.append("macd_flat")
     if ind["bb_l"] < p < ind["bb_u"]: reasons.append("price_inside_bb")
     if abs(p - ind["ema200"])/p < 0.002: reasons.append("near_ema200")
-    return None, ("no_entry:"+(",".join(reasons) if reasons else "filters_not_met"))
+    return None, "no_entry:" + (",".join(reasons) if reasons else "filters_not_met")
 
 def signal_valid(ind, side):
-    """فلترة ضد الإشارات الكاذبة: ADX + جسم الشمعة + تأكيد فوق/تحت EMA slow."""
     if not ind: return False, "indicators_na"
     reasons=[]
-
     if ind.get("adx") is not None and ind["adx"] < MIN_ADX_TRADE:
         reasons.append("weak_adx")
-
     if ind.get("atr") and ind.get("body") is not None and ind["body"] < MIN_BODY_ATR * ind["atr"]:
         reasons.append("small_body_vs_atr")
-
     if side == "buy":
         if not (ind.get("price") and ind.get("ema_slow")) or not (ind["price"] > ind["ema_slow"]*(1+CONFIRM_PCT)):
             reasons.append("no_confirm_above_ema_slow")
-    elif side == "sell":
+    else:  # sell
         if not (ind.get("price") and ind.get("ema_slow")) or not (ind["price"] < ind["ema_slow"]*(1-CONFIRM_PCT)):
             reasons.append("no_confirm_below_ema_slow")
-
-    if reasons:
-        return False, ",".join(reasons)
+    if reasons: return False, ",".join(reasons)
     return True, ""
 
 def signal_balanced(ind):
     side, why = signal_core(ind)
     if side is None:
-        log_trade(f"{IC_SHD} {why}", "yellow")
-        return None
+        log_trade(f"{IC_SHD} {why}", "yellow"); return None
     ok, why2 = signal_valid(ind, side)
     if not ok:
-        log_trade(f"{IC_SHD} no_entry:{why2}", "yellow")
-        return None
-    tag = IC_BUY if side=="buy" else IC_SELL
-    log_trade(f"{IC_TRD} {tag} signal ready", "green")
+        log_trade(f"{IC_SHD} no_entry:{why2}", "yellow"); return None
+    log_trade(f"{IC_TRD} {(IC_BUY if side=='buy' else IC_SELL)} signal ready", "green")
     return side
 
-# ======== Reverse Manager (تأكيد 2–3 دقائق) ========
+# ======== Reverse Manager (2–3m confirm) ========
 reverse_pending = {"active": False, "to": None, "since": 0, "hits": 0}
-
 def start_reverse(to_side: str):
     reverse_pending.update({"active": True, "to": to_side, "since": int(time.time()), "hits": 0})
     log_trade(f"🌀 reverse_started → {to_side}", "yellow")
-
 def feed_reverse(current_signal: str) -> bool:
     if not reverse_pending["active"]: return False
-    # accumulate consecutive confirmations
-    if current_signal == reverse_pending["to"]:
-        reverse_pending["hits"] += 1
-    else:
-        reverse_pending["hits"] = 0
+    if current_signal == reverse_pending["to"]: reverse_pending["hits"] += 1
+    else: reverse_pending["hits"] = 0
     enough_time = int(time.time()) - reverse_pending["since"] >= REV_CONFIRM_SECONDS
-    if enough_time and reverse_pending["hits"] >= REV_REQUIRE_CONSEC:
-        return True
-    return False
-
+    return bool(enough_time and reverse_pending["hits"] >= REV_REQUIRE_CONSEC)
 def end_reverse(msg="done"):
-    if reverse_pending["active"]:
-        log_trade(f"🌀 reverse_end: {msg}", "yellow")
+    if reverse_pending["active"]: log_trade(f"🌀 reverse_end: {msg}", "yellow")
     reverse_pending.update({"active": False, "to": None, "since": 0, "hits": 0})
 
 # ======== State ========
@@ -324,7 +279,8 @@ def snapshot(balance, price, ind, pos, total_pnl):
     print()
     log_trade(SEP, "cyan")
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    log_trade(f"{IC_HDR} SNAPSHOT • {now} • mode={TRADE_MODE.UPPER()} • {safe_symbol(SYMBOL)} • {INTERVAL}", "cyan")
+    # FIX: upper() (مش UPPER)
+    log_trade(f"{IC_HDR} SNAPSHOT • {now} • mode={TRADE_MODE.upper()} • {safe_symbol(SYMBOL)} • {INTERVAL}", "cyan")
     log_trade("—", "cyan")
     log_trade(f"{IC_BAL} Balance (USDT): {fmt(balance,2)}", "yellow")
     log_trade(f"{IC_PRC} Price          : {fmt(price,6)}", "green")
@@ -341,13 +297,13 @@ def snapshot(balance, price, ind, pos, total_pnl):
     log_trade(f"📦 Compound PnL : {fmt(total_pnl,6)}", "yellow")
     log_trade(SEP, "cyan")
 
-# ======== Sizing / Helpers (كما هي) ========
+# ======== Sizing ========
 def compute_size(balance, price):
     if not balance or not price: return 0
     raw = (balance * RISK_ALLOC * LEVERAGE) / price
     return market_amount(raw)
 
-# ======== Protection: attach_protection + verify_oco ========
+# ======== Protection (OCO) ========
 def attach_protection(side_opp, qty, tp, sl):
     try:
         ex.create_order(safe_symbol(SYMBOL), "take_profit_market", side_opp, qty,
@@ -361,8 +317,7 @@ def attach_protection(side_opp, qty, tp, sl):
             ex.create_order(safe_symbol(SYMBOL), "stop",  side_opp, qty, params={"stopPrice": sl, "reduceOnly": True})
             return True
         except Exception as e2:
-            log_trade(f"{IC_SHD} protection attach failed: {e2}", "yellow")
-            return False
+            log_trade(f"{IC_SHD} protection attach failed: {e2}", "yellow"); return False
 
 def verify_oco(side_opp):
     try:
@@ -373,10 +328,8 @@ def verify_oco(side_opp):
     except Exception as e:
         log_trade(f"{IC_SHD} verify_oco error: {e}", "yellow"); return False
 
-# ======== Open / Close (كما هي مع تحقق OCO) ========
 def place_protected_order(side, qty, ref_price, atr=None):
     global state
-    # SL/TP من ATR (fallback 1.5%)
     if not atr or atr <= 0:
         sl = ref_price * (0.985 if side=="buy" else 1.015)
         tp = ref_price * (1.015 if side=="buy" else 0.985)
@@ -387,8 +340,7 @@ def place_protected_order(side, qty, ref_price, atr=None):
     if TRADE_MODE == "paper":
         state.update({"open": True, "side": "long" if side=="buy" else "short",
                       "entry": ref_price, "qty": qty, "tp": tp, "sl": sl, "pnl": 0.0})
-        tag = IC_BUY if side=="buy" else IC_SELL
-        log_trade(f"{IC_TRD} {tag} [PAPER] qty={fmt(qty,4)} entry={fmt(ref_price,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
+        log_trade(f"{IC_TRD} {(IC_BUY if side=='buy' else IC_SELL)} [PAPER] qty={fmt(qty,4)} entry={fmt(ref_price,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
         return
 
     try:
@@ -398,8 +350,7 @@ def place_protected_order(side, qty, ref_price, atr=None):
 
     try:
         ex.create_order(safe_symbol(SYMBOL), "market", side, qty, params={"reduceOnly": False})
-        tag = "🟢 BUY" if side=="buy" else "🔴 SELL"
-        log_trade(f"{IC_TRD} submit {tag} qty={fmt(qty,4)}", "green")
+        log_trade(f"{IC_TRD} submit {'🟢 BUY' if side=='buy' else '🔴 SELL'} qty={fmt(qty,4)}", "green")
     except Exception as e:
         log_trade(f"{IC_BAD} open error: {e}", "red"); return
 
@@ -426,8 +377,7 @@ def place_protected_order(side, qty, ref_price, atr=None):
 
         state.update({"open": True, "side": "long" if side=="buy" else "short",
                       "entry": entry, "qty": size, "tp": tp, "sl": sl, "pnl": 0.0})
-        tag2 = IC_BUY if side=="buy" else IC_SELL
-        log_trade(f"{IC_TRD} {tag2} CONFIRMED qty={fmt(size,4)} entry={fmt(entry,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
+        log_trade(f"{IC_TRD} {(IC_BUY if side=='buy' else IC_SELL)} CONFIRMED qty={fmt(size,4)} entry={fmt(entry,6)} TP={fmt(tp,6)} SL={fmt(sl,6)}","green")
 
     except Exception as e:
         log_trade(f"{IC_BAD} post-trade validation error: {e}", "red")
@@ -463,13 +413,13 @@ def trade_loop():
             df  = fetch_ohlcv()
             ind = compute_indicators(df)
 
-            # تحديث PnL الجاري
+            # PnL الحالي
             if state["open"] and px:
                 state["pnl"] = (px - state["entry"]) * state["qty"] if state["side"]=="long" else (state["entry"] - px) * state["qty"]
 
             snapshot(bal, px, ind or {}, state.copy(), compound_pnl)
 
-            # Circuit breaker (تقلب مفرط)
+            # Circuit breaker
             if ind and ind.get("atr") and ind.get("price"):
                 atr_pct = (ind["atr"] / ind["price"]) * 100.0
                 if atr_pct >= CIRCUIT_BREAKER_ATR_PCT:
@@ -481,14 +431,12 @@ def trade_loop():
                 log_trade(f"{IC_SHD} cooldown bars left: {cool_bars}", "yellow")
                 time.sleep(60); continue
 
-            # لا قرارات بدون مؤشرات أو بيانات
             if not ind or not (px and bal):
                 time.sleep(60); continue
 
-            # توليد إشارة بعد الفلاتر
             side = signal_balanced(ind)
 
-            # Flip مؤكد: اغلاق فوري + انتظار تأكيد 2–3 دق قبل فتح العكس
+            # Flip مؤكد: اغلاق ثم انتظار تأكيد 2–3 دق
             if USE_REVERSE and state["open"] and side:
                 opposite = (state["side"]=="long" and side=="sell") or (state["side"]=="short" and side=="buy")
                 if opposite:
@@ -508,7 +456,7 @@ def trade_loop():
                     else:
                         log_trade(f"{IC_SHD} reverse blocked: slippage", "yellow")
 
-            # دخول عادي (بدون مركز مفتوح)
+            # دخول عادي
             if not state["open"] and side:
                 ref = ind.get("price")
                 if ref and abs(px - ref)/ref <= MAX_SLIPPAGE_PCT:
@@ -520,7 +468,7 @@ def trade_loop():
                 else:
                     log_trade(f"{IC_SHD} no_entry: slippage px={fmt(px,6)} ref={fmt(ref,6)}","yellow")
 
-            # Soft-guard لمس TP/SL
+            # Soft-guard TP/SL
             if state["open"] and px:
                 if state["side"]=="long" and (px <= state["sl"] or px >= state["tp"]):
                     close_position("tp" if px >= state["tp"] else "sl")
@@ -530,9 +478,9 @@ def trade_loop():
         except Exception as e:
             log_trade(f"{IC_BAD} loop error: {e}", "red")
 
-        time.sleep(60)  # قرارات كل دقيقة لستراتيجية 15m
+        time.sleep(60)  # 15m — قرار كل دقيقة
 
-# ======== Keepalive / Flask (كما هي) ========
+# ======== Keepalive / Flask ========
 def keepalive_loop():
     if not SELF_URL:
         log_trade("SELF_URL not set — keepalive disabled", "yellow"); return
