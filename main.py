@@ -25,8 +25,8 @@ PORT          = 5000
 SELF_URL      = ""        # رابط الخدمة للـ keepalive (اختياري)
 
 # BingX API (ضع مفاتيحك لو عايز LIVE، وإلا هيشتغل PAPER)
-BINGX_API_KEY    = ""
-BINGX_API_SECRET = ""
+BINGX_API_KEY    = Ecc5pdqZm8J4m55CG1cXHAPdZw4dotZFLN9n2KffzWrbqBDDAOjp53oKxQSYcP9tQYjwKt7fWGl7zBH6lGKYg
+BINGX_API_SECRET = iuSNqRlriEiz071DSBPkUlpo7SDBGDFIQMUBRsBP7sqfw40VTuGhoT0on26Ifb2tcZmtSKeP2Emrw1MHsnow
 
 # Range Filter إعدادات (مطابقة للـ Pine)
 RF_SOURCE     = "close"  # نفس input.source
