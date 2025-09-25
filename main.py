@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-RF Bot — Single-File, No-ENV Needed
-- TradingView Range Filter (Pine 1:1) signals
-- Signal-only execution (flip on opposite signal), optional Signal Hold
-- Pretty logs + Compound PnL + Effective Equity
-- Built-in risk guards (slippage, daily loss limit, ATR circuit breaker, cooldown)
-- /metrics API
+RF Bot — TradingView Range Filter (Pine 1:1) + Signal Hold + ENV (Render/Heroku friendly)
+- يقرأ المفاتيح والإعدادات من Environment Variables (لا يحتاج .env على Render)
+- إشارات BUY/SELL مطابقة للـ Pine
+- ينتظر 120 ثانية لتأكيد الإشارة (منع الإشارات الوهمية) قبل التنفيذ
+- فتح/إغلاق فقط بالإشارة العكسية (بدون SL/TP)
+- Logs ملوّنة ومنظمة + Compound PnL + Effective Equity
+- حمايات خفيفة: Slippage / Daily Loss Limit / ATR Circuit Breaker
+- /metrics API للمتابعة
 
-لتعديل الإعدادات: غيّر CONFIG بالأسفل. لو وضعت مفاتيح BingX صحيحة يعمل LIVE؛
-لو تركتها فارغة يعمل PAPER تلقائياً.
+ENV المطلوبة (حسب صورتك): 
+BINGX_API_KEY, BINGX_API_SECRET, SYMBOL, INTERVAL, LEVERAGE, RISK_ALLOC, SELF_URL (اختياري), TRADE_MODE (اختياري/لن يستخدم)
+يمكنك إضافة مفاتيح ضبط إضافية مذكورة أدناه (قِيَم افتراضية موجودة هنا).
 """
 
 import os, time, threading, requests, shutil
@@ -17,77 +20,42 @@ import ccxt
 from flask import Flask, jsonify
 from datetime import datetime, date
 
-# =====================[ CONFIG — عدّل لو حبيت ]=====================
-CONFIG = {
-    # مفاتيح BingX — اتركها فارغة للتشغيل PAPER
-    "BINGX_API_KEY": "",
-    "BINGX_API_SECRET": "",
+# =====================[ قراءة ENV + افتراضات آمنة ]=====================
+SYMBOL        = os.getenv("SYMBOL", "DOGE/USDT:USDT")
+INTERVAL      = os.getenv("INTERVAL", "15m")
+LEVERAGE      = int(float(os.getenv("LEVERAGE", "10")))
+RISK_ALLOC    = float(os.getenv("RISK_ALLOC", "0.60"))
+SELF_URL      = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
+PORT          = int(float(os.getenv("PORT", "5000")))
 
-    # السوق/الفريم
-    "SYMBOL": "DOGE/USDT:USDT",    # BingX Perp
-    "INTERVAL": "15m",
+API_KEY       = os.getenv("BINGX_API_KEY", "")
+API_SECRET    = os.getenv("BINGX_API_SECRET", "")
+MODE_LIVE     = bool(API_KEY and API_SECRET)   # لو في مفاتيح = LIVE، غير كده = PAPER
 
-    # رأس المال والمخاطرة
-    "LEVERAGE": 10,
-    "RISK_ALLOC": 0.60,            # 60% من الرصيد
+# Range Filter مطابق Pine
+RF_SOURCE     = os.getenv("RF_SOURCE", "close").lower()   # close/open/high/low
+RF_PERIOD     = int(float(os.getenv("RF_PERIOD", "20")))
+RF_MULT       = float(os.getenv("RF_MULT", "3.5"))
 
-    # Range Filter (Pine 1:1)
-    "RF_SOURCE": "close",          # close/open/high/low
-    "RF_PERIOD": 20,
-    "RF_MULT": 3.5,
+# سلوك القرار
+USE_TV_BAR        = os.getenv("USE_TV_BAR", "true").lower() == "true"   # true=إحساس TV
+DECISION_EVERY_S  = int(float(os.getenv("DECISION_EVERY_S", "30")))
+MAX_SLIPPAGE_PCT  = float(os.getenv("MAX_SLIPPAGE_PCT", "0.004"))       # 0.4%
+COOLDOWN_BARS     = int(float(os.getenv("COOLDOWN_BARS", "0")))
 
-    # سلوك الشمعة والتنفيذ
-    "USE_TV_BAR": True,            # True = نفس إحساس TV أثناء الشمعة
-    "DECISION_EVERY_S": 30,        # قرار كل X ثانية
-    "MAX_SLIPPAGE_PCT": 0.004,     # حد الانزلاق 0.4%
-    "COOLDOWN_BARS": 0,            # تهدئة بعد الصفقة (0=لا شيء)
+# Signal Hold لتأكيد الإشارة (منع الإشارات الوهمية)
+SIGNAL_HOLD_S     = int(float(os.getenv("SIGNAL_HOLD_S", "120")))       # 120 ثانية
+SIGNAL_MAX_AGE_S  = int(float(os.getenv("SIGNAL_MAX_AGE_S", "900")))    # 15 دقيقة
 
-    # Signal Hold (تثبيت الإشارة لمنع الكاذبة)
-    "SIGNAL_HOLD_S": 120,          # 120 ثانية (1-2 دقيقة)
-    "SIGNAL_MAX_AGE_S": 900,       # أقصى عمر للإشارة المعلقة
+# حمايات اختيارية
+USE_CIRCUIT_BREAKER = os.getenv("USE_CIRCUIT_BREAKER", "true").lower() == "true"
+CB_ATR_MULT         = float(os.getenv("CB_ATR_MULT", "3.5"))
+CB_PAUSE_BARS       = int(float(os.getenv("CB_PAUSE_BARS", "2")))
 
-    # حمايات ذكية (يمكنك إبقاؤها كما هي)
-    "USE_CIRCUIT_BREAKER": True,   # قاطع على حركة ATR كبيرة
-    "CB_ATR_MULT": 3.5,            # لو شمعة > 3.5×ATR نوقف مؤقتًا
-    "CB_PAUSE_BARS": 2,            # إيقاف X شموع قرار
+USE_DAILY_LOSS_LIMIT = os.getenv("USE_DAILY_LOSS_LIMIT", "true").lower() == "true"
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.08"))
 
-    "USE_DAILY_LOSS_LIMIT": True,  # حد خسارة يومي
-    "DAILY_LOSS_LIMIT_PCT": 0.08,  # 8% من رصيد أول اليوم
-
-    # Port و keepalive
-    "PORT": 5000,
-    "SELF_URL": "",                # ضع رابطك لو عايز keepalive
-}
-
-# ========== لا تعدّل تحت إلا لو فاهم ==========
-# استنتاج وضع التشغيل
-API_KEY = CONFIG["BINGX_API_KEY"]; API_SECRET = CONFIG["BINGX_API_SECRET"]
-MODE_LIVE = bool(API_KEY and API_SECRET)
-
-SYMBOL   = CONFIG["SYMBOL"];  INTERVAL=CONFIG["INTERVAL"]
-LEVERAGE = int(CONFIG["LEVERAGE"]); RISK_ALLOC=float(CONFIG["RISK_ALLOC"])
-
-RF_SOURCE= CONFIG["RF_SOURCE"].lower(); RF_PERIOD=int(CONFIG["RF_PERIOD"]); RF_MULT=float(CONFIG["RF_MULT"])
-
-USE_TV_BAR = bool(CONFIG["USE_TV_BAR"])
-DECISION_EVERY_S = int(CONFIG["DECISION_EVERY_S"])
-MAX_SLIPPAGE_PCT = float(CONFIG["MAX_SLIPPAGE_PCT"])
-COOLDOWN_BARS = int(CONFIG["COOLDOWN_BARS"])
-
-SIGNAL_HOLD_S = int(CONFIG["SIGNAL_HOLD_S"])
-SIGNAL_MAX_AGE_S = int(CONFIG["SIGNAL_MAX_AGE_S"])
-
-USE_CIRCUIT_BREAKER = bool(CONFIG["USE_CIRCUIT_BREAKER"])
-CB_ATR_MULT = float(CONFIG["CB_ATR_MULT"])
-CB_PAUSE_BARS = int(CONFIG["CB_PAUSE_BARS"])
-
-USE_DAILY_LOSS_LIMIT = bool(CONFIG["USE_DAILY_LOSS_LIMIT"])
-DAILY_LOSS_LIMIT_PCT = float(CONFIG["DAILY_LOSS_LIMIT_PCT"])
-
-PORT = int(CONFIG["PORT"])
-SELF_URL = CONFIG["SELF_URL"]
-
-# ================ UI ================
+# =====================[ UI ]=====================
 try:
     from termcolor import colored
 except Exception:
@@ -102,7 +70,8 @@ def fmt(v, d=6, na="N/A"):
     try:
         if v is None: return na
         return f"{float(v):.{d}f}"
-    except: return na
+    except Exception:
+        return na
 
 def safe_symbol(s):
     if s.endswith(":USDT") or s.endswith(":USDC"): return s
@@ -114,11 +83,15 @@ def colorize_by_side(text):
         return colored(text, "green" if state["side"]=="long" else "red")
     return text
 
-# ================ Exchange ================
+print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} | apiKey:{'✔' if API_KEY else '✖'} secret:{'✔' if API_SECRET else '✖'}", "yellow"))
+
+# =====================[ Exchange ]=====================
 def make_exchange():
     return ccxt.bingx({
-        "apiKey": API_KEY, "secret": API_SECRET,
-        "enableRateLimit": True, "timeout": 20000,
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "enableRateLimit": True,
+        "timeout": 20000,
         "options": {"defaultType": "swap", "defaultMarginMode": "isolated"}
     })
 ex = make_exchange()
@@ -126,17 +99,35 @@ try: ex.load_markets()
 except Exception: pass
 
 def balance_usdt():
+    """قراءة مرنة للرصيد + طباعة سبب الفشل إن وجد."""
     if not MODE_LIVE: return None
     try:
         b = ex.fetch_balance(params={"type":"swap"})
-        return b.get("total",{}).get("USDT")
-    except: return None
+        usdt = None
+        if "USDT" in b.get("total", {}): usdt = b["total"]["USDT"]
+        elif "USDT" in b.get("free", {}): usdt = b["free"]["USDT"]
+        if usdt is None and "info" in b:
+            info = b["info"]
+            for key in ("data","balances","assets"):
+                arr = info.get(key)
+                if isinstance(arr, list):
+                    for it in arr:
+                        sym = (it.get("asset") or it.get("currency") or it.get("code") or "").upper()
+                        if sym=="USDT":
+                            usdt = float(it.get("total", it.get("balance", it.get("availableBalance", 0.0))))
+                            break
+        if usdt is None: print(colored(f"⚠️ balance parse fail: {b}", "yellow"))
+        return usdt
+    except Exception as e:
+        print(colored(f"❌ balance error: {e}", "red"))
+        return None
 
 def price_now():
     try:
         t = ex.fetch_ticker(safe_symbol(SYMBOL))
         return t.get("last") or t.get("close")
-    except: return None
+    except Exception:
+        return None
 
 def fetch_ohlcv(limit=500):
     rows = ex.fetch_ohlcv(safe_symbol(SYMBOL), timeframe=INTERVAL, limit=limit, params={"type":"swap"})
@@ -149,7 +140,8 @@ def market_amount(amount):
         min_amt = m.get("limits",{}).get("amount",{}).get("min",0.001)
         amt = float(f"{float(amount):.{prec}f}")
         return max(amt, float(min_amt or 0.001))
-    except: return float(amount)
+    except Exception:
+        return float(amount)
 
 def compute_size(balance, price):
     if not price: return 0.0
@@ -157,14 +149,11 @@ def compute_size(balance, price):
     raw = (bal * RISK_ALLOC * LEVERAGE) / price
     return market_amount(raw)
 
-# ================ Range Filter (Pine 1:1) ================
+# =====================[ Range Filter Pine 1:1 ]=====================
 def _ema(s: pd.Series, n: int): return s.ewm(span=n, adjust=False).mean()
-
 def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
-    avrng = _ema((src - src.shift(1)).abs(), n)
-    wper = (n*2) - 1
+    avrng = _ema((src - src.shift(1)).abs(), n); wper = (n*2) - 1
     return _ema(avrng, wper) * qty
-
 def _rng_filter(src: pd.Series, rsize: pd.Series):
     rfilt_vals = [float(src.iloc[0])]
     for i in range(1, len(src)):
@@ -176,6 +165,11 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
     hi = rfilt + rsize; lo = rfilt - rsize
     return hi, lo, rfilt
 
+def _atr_last(df: pd.DataFrame, n: int = 14):
+    h=df["high"].astype(float); l=df["low"].astype(float); c=df["close"].astype(float)
+    tr = pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean().iloc[-1] if len(tr) else None
+
 def compute_rf(df: pd.DataFrame, use_tv_bar: bool, rf_source: str, rf_period: int, rf_mult: float):
     s = df[rf_source].astype(float)
     hi, lo, filt = _rng_filter(s, _rng_size(s, rf_mult, rf_period))
@@ -186,7 +180,7 @@ def compute_rf(df: pd.DataFrame, use_tv_bar: bool, rf_source: str, rf_period: in
     longCond  = (src_gt_f & src_gt_p & (upward > 0)) | (src_gt_f & src_lt_p & (upward > 0))
     shortCond = (src_lt_f & src_lt_p & (downward > 0)) | (src_lt_f & src_gt_p & (downward > 0))
     CondIni = pd.Series(0, index=s.index)
-    for i in range(1, len(s)):
+    for i in range(1,len(s)):
         if  bool(longCond.iloc[i]):  CondIni.iloc[i]=1
         elif bool(shortCond.iloc[i]): CondIni.iloc[i]=-1
         else:                         CondIni.iloc[i]=CondIni.iloc[i-1]
@@ -194,7 +188,7 @@ def compute_rf(df: pd.DataFrame, use_tv_bar: bool, rf_source: str, rf_period: in
     shortCondition = shortCond & (CondIni.shift(1) == 1)
     i = len(df)-1 if use_tv_bar else len(df)-2
     def last_at(series: pd.Series):
-        v = series.iloc[i]; return None if pd.isna(v) else float(v)
+        v=series.iloc[i]; return None if pd.isna(v) else float(v)
     return {
         "bar_index": int(i),
         "price": last_at(df["close"].astype(float)),
@@ -204,54 +198,42 @@ def compute_rf(df: pd.DataFrame, use_tv_bar: bool, rf_source: str, rf_period: in
         "fdir":  1.0 if (filt.iloc[i] > filt.iloc[i-1]) else (-1.0 if (filt.iloc[i] < filt.iloc[i-1]) else float(fdir.iloc[i-1] if i-1>=0 else 0.0)),
         "longCond": bool(longCond.iloc[i]), "shortCond": bool(shortCond.iloc[i]),
         "long": bool(longCondition.iloc[i]), "short": bool(shortCondition.iloc[i]),
-        # إضافات لحمايات ATR/Circuit
-        "atr": _atr(df)
+        "atr": _atr_last(df)
     }
 
-def _atr(df: pd.DataFrame, n: int = 14):
-    h = df["high"].astype(float); l=df["low"].astype(float); c=df["close"].astype(float)
-    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean().iloc[-1] if len(tr) else None
-
-# ================ State / Pending / Risk ================
+# =====================[ State / Pending / Guards ]=====================
 state = {"open": False, "side": None, "entry": None, "qty": None, "pnl": 0.0}
 compound_pnl = 0.0
-
 pending = {"side": None, "first_seen": None, "bar_index": None}
 cooldown_left = 0
 cb_pause_left = 0
-
 _daily_anchor_equity = None
 _daily_halted = False
+_last_day = None
 
 def reset_daily_limits(balance):
     global _daily_anchor_equity, _daily_halted
-    _daily_anchor_equity = (balance or 0.0)
-    _daily_halted = False
+    _daily_anchor_equity = (balance or 0.0); _daily_halted = False
 
 def check_daily_loss_guard(balance):
-    """ارجع True لو التداول مسموح، False لو متوقف يوميًا"""
     global _daily_halted
     if not USE_DAILY_LOSS_LIMIT or balance is None: return True
     if _daily_anchor_equity is None: return True
     drawdown = (_daily_anchor_equity - balance) / max(_daily_anchor_equity, 1e-9)
-    if drawdown >= DAILY_LOSS_LIMIT_PCT:
-        _daily_halted = True
+    if drawdown >= DAILY_LOSS_LIMIT_PCT: _daily_halted = True
     return not _daily_halted
 
 def set_pending(side, bar_idx):
     pending.update({"side": side, "first_seen": time.time(), "bar_index": bar_idx})
-
 def clear_pending():
     pending.update({"side": None, "first_seen": None, "bar_index": None})
-
 def pending_ok(side, bar_idx):
     if pending["side"] != side: return False
     if pending["first_seen"] is None: return False
     if bar_idx < pending["bar_index"]: return False
     return (time.time() - pending["first_seen"]) >= SIGNAL_HOLD_S
 
-# ================ Logs ================
+# =====================[ Logs ]=====================
 def snapshot(balance, rf, total_pnl):
     line("═","cyan")
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -299,7 +281,7 @@ def log_reason(prefix, rf, note=""):
            f"long={rf['long']} short={rf['short']} {note}")
     print(colored(msg, "cyan"))
 
-# ================ Open/Close (Signal-only) ================
+# =====================[ Open/Close (Signal-only) ]=====================
 def open_market(side, qty, ref_price):
     global state
     if not MODE_LIVE:
@@ -339,57 +321,40 @@ def close_market(reason):
     print(colored(f"🔚 CLOSE {state['side']} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
     state.update({"open": False, "side": None, "entry": None, "qty": None, "pnl": 0.0})
 
-# ================ Main Loop ================
-# يومية الحماية
-_last_day = None
+# =====================[ Main Loop ]=====================
+cooldown_left = 0
+cb_pause_left = 0
 
 def trade_loop():
     global state, compound_pnl, cooldown_left, cb_pause_left, _last_day
     while True:
         try:
-            # إدارة يومية
+            # Daily anchor
             today = date.today()
             if _last_day != today:
                 _last_day = today
-                bal = balance_usdt()
-                reset_daily_limits(bal)
+                reset_daily_limits(balance_usdt())
 
-            # داتا
             bal = balance_usdt()
             px  = price_now()
             df  = fetch_ohlcv()
             if df is None or len(df) < 60:
                 time.sleep(DECISION_EVERY_S); continue
 
-            # مؤشرات RF
-            rf = compute_rf(df, USE_TV_BAR, RF_SOURCE, RF_PERIOD, RF_MULT)
+            rf  = compute_rf(df, USE_TV_BAR, RF_SOURCE, RF_PERIOD, RF_MULT)
 
-            # تحديث PnL الجاري
+            # PnL لحظي
             if state["open"] and px:
                 state["pnl"] = (px - state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"] - px)*state["qty"]
 
             snapshot(bal, rf, compound_pnl)
             log_reason("WHY", rf, f"pending={pending}")
 
-            # حمايات عامة
+            # حمايات
             if USE_DAILY_LOSS_LIMIT and not check_daily_loss_guard(bal):
                 print(colored("🛑 Daily loss limit hit — trading halted for today.", "red"))
                 time.sleep(DECISION_EVERY_S); continue
 
-            if cb_pause_left > 0:
-                cb_pause_left -= 1
-                print(colored(f"🧯 Circuit pause active ({cb_pause_left} bars left)", "yellow"))
-                time.sleep(DECISION_EVERY_S); continue
-
-            if cooldown_left > 0:
-                cooldown_left -= 1
-                print(colored(f"⏳ Cooldown active ({cooldown_left} bars left)", "yellow"))
-                time.sleep(DECISION_EVERY_S); continue
-
-            # دائرة الإشارة الخام
-            raw_side = "buy" if rf["long"] else ("sell" if rf["short"] else None)
-
-            # قاطع ATR (شمعة مبالغ فيها)
             if USE_CIRCUIT_BREAKER and rf.get("atr") and len(df) >= 2:
                 rng = abs(float(df["close"].iloc[-1]) - float(df["open"].iloc[-1]))
                 if rf["atr"] and (rng >= CB_ATR_MULT * rf["atr"]):
@@ -397,11 +362,23 @@ def trade_loop():
                     print(colored(f"🧯 CircuitBreaker: rng={fmt(rng)} >= {CB_ATR_MULT}×ATR({fmt(rf['atr'])}). Pausing.", "yellow"))
                     time.sleep(DECISION_EVERY_S); continue
 
+            if cb_pause_left > 0:
+                cb_pause_left -= 1
+                print(colored(f"🧯 CB Pause ({cb_pause_left} bars left)", "yellow"))
+                time.sleep(DECISION_EVERY_S); continue
+
+            if cooldown_left > 0:
+                cooldown_left -= 1
+                print(colored(f"⏳ Cooldown ({cooldown_left} bars left)", "yellow"))
+                time.sleep(DECISION_EVERY_S); continue
+
+            # الإشارة الخام من Pine
+            raw_side = "buy" if rf["long"] else ("sell" if rf["short"] else None)
+
             # Signal Hold
             side = None
             if raw_side is None:
-                if pending["side"]:
-                    print(colored("hold_cancel: signal disappeared", "yellow"))
+                if pending["side"]: print(colored("hold_cancel: signal disappeared", "yellow"))
                 clear_pending()
             else:
                 if pending["side"] is None:
@@ -420,8 +397,7 @@ def trade_loop():
             # تنفيذ بعد ثبوت الإشارة
             if side:
                 ref = rf.get("price") or px
-                if not (ref and px):
-                    time.sleep(DECISION_EVERY_S); continue
+                if not (ref and px): time.sleep(DECISION_EVERY_S); continue
                 if abs(px - ref)/ref > MAX_SLIPPAGE_PCT:
                     print(colored(f"skip: slippage px={fmt(px)} ref={fmt(ref)}", "yellow"))
                     time.sleep(DECISION_EVERY_S); continue
@@ -444,7 +420,7 @@ def trade_loop():
 
         time.sleep(DECISION_EVERY_S)
 
-# ================ Keepalive / API ================
+# =====================[ Keepalive / API ]=====================
 def keepalive_loop():
     if not SELF_URL: return
     url = SELF_URL.rstrip("/")
@@ -453,9 +429,10 @@ def keepalive_loop():
         except Exception: pass
         time.sleep(50)
 
+from flask import Flask
 app = Flask(__name__)
 @app.route("/")
-def home(): return f"✅ RF Single Bot — {safe_symbol(SYMBOL)} {INTERVAL} — {'LIVE' if MODE_LIVE else 'PAPER'}"
+def home(): return f"✅ RF Signal-Hold Bot — {safe_symbol(SYMBOL)} {INTERVAL} — {'LIVE' if MODE_LIVE else 'PAPER'}"
 @app.route("/metrics")
 def metrics():
     return jsonify({
@@ -474,7 +451,7 @@ def metrics():
         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     })
 
-# ================ Boot ================
+# =====================[ Boot ]=====================
 threading.Thread(target=trade_loop, daemon=True).start()
 threading.Thread(target=keepalive_loop, daemon=True).start()
 if __name__ == "__main__":
