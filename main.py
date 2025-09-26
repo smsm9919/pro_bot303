@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-RF Bot — EXACT TradingView Range Filter (B&S) — No Protections
-- مطابقة 1:1 لكود Pine الذي أرسلته (بدون أي فلاتر أو تأخيرات)
-- الدخول/الخروج فقط بالإشارة العكسية من المؤشر
-- لا SL/TP، لا Hold، لا Circuit Breaker
-- يقرأ من ENV: BINGX_API_KEY, BINGX_API_SECRET, SYMBOL, INTERVAL, LEVERAGE, RISK_ALLOC, SELF_URL
+RF Bot — EXACT TradingView Range Filter (B&S) — Live/Paper
+- مطابقة Pine 1:1 (rng_size → rng_filter → fdir → long/shortCond → CondIni → long/shortCondition)
+- فتح/إغلاق فقط عند الإشارة العكسية (لا SL/TP ولا فلاتر إضافية)
+- يقرأ من ENV:
+  BINGX_API_KEY, BINGX_API_SECRET, SYMBOL, INTERVAL, LEVERAGE, RISK_ALLOC,
+  SELF_URL, PORT, RF_SOURCE, RF_PERIOD, RF_MULT, USE_TV_BAR, DECISION_EVERY_S, TRADE_MODE
 """
 
 import os, time, threading, requests
@@ -23,16 +24,21 @@ PORT       = int(float(os.getenv("PORT", "5000")))
 
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
-MODE_LIVE  = bool(API_KEY and API_SECRET)
+TRADE_MODE = os.getenv("TRADE_MODE", "").lower()  # "live" أو "paper" (اختياري)
+
+# لو TRADE_MODE اتحدد يفرض النمط، وإلا يعتمد على وجود المفاتيح
+if   TRADE_MODE == "live":  MODE_LIVE = True
+elif TRADE_MODE == "paper": MODE_LIVE = False
+else:                       MODE_LIVE = bool(API_KEY and API_SECRET)
 
 # إعدادات المؤشر (مطابقة Pine)
 RF_SOURCE  = os.getenv("RF_SOURCE", "close").lower()  # close/open/high/low
 RF_PERIOD  = int(float(os.getenv("RF_PERIOD", "20")))
 RF_MULT    = float(os.getenv("RF_MULT", "3.5"))
 
-# التوافق مع TradingView: استخدم الشمعة الحالية
-USE_TV_BAR = os.getenv("USE_TV_BAR", "true").lower() == "true"
-LOOP_SLEEP = int(float(os.getenv("DECISION_EVERY_S", "30")))  # تكرار كل 30s
+# توافق توقيت TV
+USE_TV_BAR = os.getenv("USE_TV_BAR", "true").lower() == "true"   # True = الشمعة الحالية
+LOOP_SLEEP = int(float(os.getenv("DECISION_EVERY_S", "30")))     # كل كام ثانية يشيّك
 
 # ======================= UI =======================
 try:
@@ -40,25 +46,24 @@ try:
 except Exception:
     def colored(t,*a,**k): return t
 
-def sep():
-    print(colored("─"*100, "cyan"), flush=True)
+def sep(): print(colored("─"*100, "cyan"), flush=True)
 
 def safe_symbol(s):
     if s.endswith(":USDT") or s.endswith(":USDC"): return s
-    if "/USDT" in s and not s.endswith(":USDT"): return s + ":USDT"
+    if "/USDT" in s and not s.endswith(":USDT"):   return s + ":USDT"
     return s
 
 def fmt(v, d=6, na="N/A"):
     try:
         if v is None: return na
         return f"{float(v):.{d}f}"
-    except Exception:
-        return na
+    except Exception: return na
 
 def log_side(text):
     if state["open"]:
-        return print(colored(text, "green" if state["side"]=="long" else "red"), flush=True)
-    print(text, flush=True)
+        print(colored(text, "green" if state["side"]=="long" else "red"), flush=True)
+    else:
+        print(text, flush=True)
 
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} | apiKey:{'✔' if API_KEY else '✖'} secret:{'✔' if API_SECRET else '✖'}", "yellow"))
 
@@ -87,7 +92,8 @@ def price_now():
     try:
         t = ex.fetch_ticker(safe_symbol(SYMBOL))
         return t.get("last") or t.get("close")
-    except Exception: return None
+    except Exception:
+        return None
 
 def fetch_ohlcv(limit=500):
     rows = ex.fetch_ohlcv(safe_symbol(SYMBOL), timeframe=INTERVAL, limit=limit, params={"type":"swap"})
@@ -96,10 +102,10 @@ def fetch_ohlcv(limit=500):
 def market_amount(amount):
     try:
         m = ex.market(safe_symbol(SYMBOL))
-        prec = int(m.get("precision",{}).get("amount",3))
-        min_amt = m.get("limits",{}).get("amount",{}).get("min",0.001)
+        prec   = int(m.get("precision",{}).get("amount", 3))
+        minamt = m.get("limits",{}).get("amount",{}).get("min", 0.001)
         amt = float(f"{float(amount):.{prec}f}")
-        return max(amt, float(min_amt or 0.001))
+        return max(amt, float(minamt or 0.001))
     except Exception:
         return float(amount)
 
@@ -112,13 +118,11 @@ def compute_size(balance, price):
 def _ema(s: pd.Series, n: int): return s.ewm(span=n, adjust=False).mean()
 
 def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
-    # avrng = ema(abs(x - x[1]), n)
     avrng = _ema((src - src.shift(1)).abs(), n)
     wper  = (n*2) - 1
     return _ema(avrng, wper) * qty
 
 def _rng_filter(src: pd.Series, rsize: pd.Series):
-    # يحاكي array.set/array.get في Pine
     rf = [float(src.iloc[0])]
     for i in range(1, len(src)):
         prev = rf[-1]; x = float(src.iloc[i]); r = float(rsize.iloc[i]); cur = prev
@@ -135,7 +139,7 @@ def compute_tv_signals(df: pd.DataFrame):
     s = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(s, _rng_size(s, RF_MULT, RF_PERIOD))
     dfilt = filt - filt.shift(1)
-    fdir = pd.Series(0.0, index=filt.index).mask(dfilt>0,1).mask(dfilt<0,-1).ffill().fillna(0.0)
+    fdir  = pd.Series(0.0, index=filt.index).mask(dfilt>0,1).mask(dfilt<0,-1).ffill().fillna(0.0)
 
     upward   = (fdir==1).astype(int)
     downward = (fdir==-1).astype(int)
@@ -148,17 +152,16 @@ def compute_tv_signals(df: pd.DataFrame):
 
     CondIni = pd.Series(0, index=s.index)
     for i in range(1, len(s)):
-        if bool(longCond.iloc[i]):  CondIni.iloc[i] =  1
-        elif bool(shortCond.iloc[i]): CondIni.iloc[i] = -1
-        else: CondIni.iloc[i] = CondIni.iloc[i-1]
+        if bool(longCond.iloc[i]):      CondIni.iloc[i] =  1
+        elif bool(shortCond.iloc[i]):   CondIni.iloc[i] = -1
+        else:                           CondIni.iloc[i] = CondIni.iloc[i-1]
 
     longSignal  = longCond  & (CondIni.shift(1) == -1)
     shortSignal = shortCond & (CondIni.shift(1) ==  1)
 
     i = len(df)-1 if USE_TV_BAR else len(df)-2
     def last_at(series: pd.Series):
-        v = series.iloc[i]
-        return None if pd.isna(v) else float(v)
+        v = series.iloc[i];  return None if pd.isna(v) else float(v)
     return {
         "bar_index": i,
         "time": int(df["time"].iloc[i]),
@@ -187,10 +190,10 @@ def snapshot(bal, info):
     print(f"   📏 Filter    : {fmt(info.get('filter'))}")
     print(f"   🔼 Band Hi   : {fmt(info.get('hi'))}")
     print(f"   🔽 Band Lo   : {fmt(info.get('lo'))}")
-    d = "🟢 Up" if info.get("fdir")==1 else ("🔴 Down" if info.get("fdir")==-1 else "⚪ Flat")
+    d = "🟢 Up" if info and info.get("fdir")==1 else ("🔴 Down" if info and info.get("fdir")==-1 else "⚪ Flat")
     print(f"   🧭 Direction : {d}")
-    print(f"   🟩 LongSig   : {info.get('long')}")
-    print(f"   🟥 ShortSig  : {info.get('short')}")
+    print(f"   🟩 LongSig   : {info.get('long') if info else False}")
+    print(f"   🟥 ShortSig  : {info.get('short') if info else False}")
     print()
     log_side("🧭 POSITION")
     bal_txt = "N/A (paper)" if not MODE_LIVE else fmt(bal,2)
@@ -254,10 +257,11 @@ def trade_loop():
     global state
     while True:
         try:
-            bal = balance_usdt()
-            px  = price_now()
-            df  = fetch_ohlcv()
+            bal  = balance_usdt()
+            px   = price_now()
+            df   = fetch_ohlcv()
             info = compute_tv_signals(df)
+
             if info and state["open"] and px:
                 state["pnl"] = (px - state["entry"]) * state["qty"] if state["side"]=="long" else (state["entry"] - px) * state["qty"]
 
@@ -266,13 +270,11 @@ def trade_loop():
             if not info or not px:
                 time.sleep(LOOP_SLEEP); continue
 
-            # إشارات المؤشر "كما هي"
+            # إشارات المؤشر كما هي
             raw_side = "buy" if info["long"] else ("sell" if info["short"] else None)
-
             if raw_side:
                 desired = "long" if raw_side=="buy" else "short"
                 qty = compute_size(bal, px)
-
                 if state["open"]:
                     if state["side"] != desired:
                         close_market("opposite_signal")
